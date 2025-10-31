@@ -12,6 +12,6 @@ coco/
 myenv/
 
 TODO.md
-
 hf_token.txt
 requirements.txt
+.bashrc
