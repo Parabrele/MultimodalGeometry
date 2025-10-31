@@ -1,0 +1,17 @@
+*.pyc
+*.pyo
+**/__pycache__/
+*.egg-info/
+*.eggs/
+*.log
+*.zip
+
+biblio/
+output/
+coco/
+myenv/
+
+TODO.md
+
+hf_token.txt
+requirements.txt
