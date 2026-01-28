@@ -450,7 +450,7 @@ def Monge(X, Y, a=None, b=None, return_plan=False, metric='arccos'):
         return cost
 
 @torch.no_grad()
-def Wasserstein(X, Y, a=None, b=None, return_plan=False, return_C=False, metric='arccos'):
+def Wasserstein(X, Y, a=None, b=None, return_plan=False, return_C=False, metric='l2'):
     assert metric in ['l2', 'cosim', 'arccos'], f"metric must be 'l2', 'cosim' or 'arccos'. Got {metric} instead"
 
     if metric == 'l2':

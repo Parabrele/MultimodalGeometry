@@ -11,6 +11,8 @@ import torch
 from einops import rearrange
 from tqdm import tqdm
 
+import wandb
+
 from overcomplete.metrics import l2, r2_score, l0_eps
 from overcomplete.sae.trackers import DeadCodeTracker
 
@@ -221,7 +223,8 @@ def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
 
 def train_multimodal_sae(model, dataloader, criterion, optimizer, scheduler=None,
               nb_epochs=20, clip_grad=1.0, monitoring=1, device="cpu", verbose=False,
-              checkpoint_path=None, checkpoint_interval=5, checkpoint_name="checkpoint.pt"):
+              checkpoint_path=None, checkpoint_interval=5, checkpoint_name="checkpoint.pt",
+              vision_only=False):
     """
     Train a Sparse Autoencoder (SAE) model.
 
@@ -256,9 +259,25 @@ def train_multimodal_sae(model, dataloader, criterion, optimizer, scheduler=None
         Logs of training statistics.
     """
     logs = defaultdict(list)
-
+    model.train()
     best_loss = None
+    multimodal = not vision_only
 
+    checkpoint = {
+        'epoch': 0,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'logs': logs
+    }
+
+    # check that checkpoint_path exists, otherwise create it.
+    full_checkpoint_path = os.path.join(checkpoint_path, checkpoint_name + f"_epoch_{0}" + ".pt")
+    dir_name = os.path.dirname(full_checkpoint_path)
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+    torch.save(checkpoint, full_checkpoint_path)
+    
     for epoch in range(nb_epochs):
         model.train()
 
@@ -274,11 +293,15 @@ def train_multimodal_sae(model, dataloader, criterion, optimizer, scheduler=None
         for batch in progress_bar:
             batch_count += 1
 
-            image, text = extract_multimodal_input(batch) #shapes [batch_size, d_model] and [batch_size, d_model]
-            image = image.to(device, non_blocking=True)
-            text = text.to(device, non_blocking=True)
-            x = torch.cat((image, text), dim=0) #shapes [2*batch_size, d_model]
-
+            if multimodal:
+                image, text = extract_multimodal_input(batch) #shapes [batch_size, d_model] and [batch_size, d_model]
+                image = image.to(device, non_blocking=True)
+                text = text.to(device, non_blocking=True)
+                x = torch.cat((image, text), dim=0) #shapes [2*batch_size, d_model]
+            else:
+                x = extract_input(batch)
+                x = x.to(device, non_blocking=True)
+                
             optimizer.zero_grad()
             z_pre, z, x_hat = model(x)
             loss = criterion(x, x_hat, z_pre, z, model.get_dictionary())
@@ -335,23 +358,194 @@ def train_multimodal_sae(model, dataloader, criterion, optimizer, scheduler=None
                   f"Time: {epoch_duration:.4f} seconds")
         
         if checkpoint_path is not None and ((epoch + 1) % checkpoint_interval == 0 or epoch == nb_epochs - 1):
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'logs': logs
+            }
+            full_checkpoint_path = os.path.join(checkpoint_path, checkpoint_name + f"_epoch_{epoch+1}" + ".pt")
+            dir_name = os.path.dirname(full_checkpoint_path)
+            if not os.path.exists(dir_name):
+                os.makedirs(dir_name)
+            torch.save(checkpoint, full_checkpoint_path)
+            
             if best_loss is None or avg_loss < best_loss:
                 best_loss = avg_loss
-                
-                checkpoint = {
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'logs': logs
-                }
+                torch.save(checkpoint, full_checkpoint_path.replace(f"_epoch_{epoch+1}", ""))
 
-                # check that checkpoint_path exists, otherwise create it
-                full_checkpoint_path = os.path.join(checkpoint_path, checkpoint_name)
-                dir_name = os.path.dirname(full_checkpoint_path)
-                if not os.path.exists(dir_name):
-                    os.makedirs(dir_name)
-                torch.save(checkpoint, full_checkpoint_path)
+    return logs
+
+
+def train_multiple_saes(
+        saes, train_loaders, losses, optimizers, schedulers=None,
+        nb_epochs=20, N_tokens=None, clip_grad=1.0, device="cpu",
+        monitoring=1, verbose=False,
+        checkpoint_path=None,
+        checkpoint_interval=5, checkpoint_name="checkpoint.pt",
+        run=None,
+    ):
+    logs = defaultdict(list)
+    for model in saes: model.train()
+    best_loss = None
+
+    checkpoint = {
+        'epoch': 0,
+        'model_state_dict': [model.state_dict() for model in saes],
+        'optimizer_state_dict': [optimizer.state_dict() for optimizer in optimizers],
+        'scheduler_state_dict': [scheduler.state_dict() if scheduler else None for scheduler in schedulers] if schedulers else None,
+        'logs': logs
+    }
+
+    # check that checkpoint_path exists, otherwise create it.
+    full_checkpoint_path = os.path.join(checkpoint_path, checkpoint_name + f"_epoch_{0}" + ".pt")
+    dir_name = os.path.dirname(full_checkpoint_path)
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+    torch.save(checkpoint, full_checkpoint_path)
+    
+    plot_logs = {f"sae_{i+1}/{len(saes)}": defaultdict(float) for i in range(len(saes))}
+    
+    global_step = 0
+    global_tokens = 0
+    for epoch in range(nb_epochs):
+
+        start_time = time.time()
+        epoch_loss = 0.0
+        epoch_error = 0.0
+        epoch_sparsity = 0.0
+        batch_count = 0
+
+        dead_trackers = None
+
+        # train_loaders is a list of dataloaders. zip them together to iterate simultaneously.
+        dataloader = zip(*train_loaders)
+        progress_bar = tqdm(dataloader, disable=not verbose)
+        for batch in progress_bar:
+            batch_count += 1
+            global_step += 1
+
+            xs, z_pres, zs, x_hats = [], [], [], []
+            for i, model in enumerate(saes):
+                optimizer = optimizers[i]
+                optimizer.zero_grad()
+                x = extract_input(batch[i]).to(device, non_blocking=True)
+                z_pre, z, x_hat = model(x)
+                
+                if i == 0:
+                    global_tokens += x.shape[0]
+                
+                xs.append(x), z_pres.append(z_pre), zs.append(z), x_hats.append(x_hat)
+            
+            # for each model select a random other model for cyclic reconstruction
+            loss = 0.0
+            for i, model in enumerate(saes):
+                if len(saes) > 1:
+                    j = (i + torch.randint(1, len(saes), (1,)).item()) % len(saes) # ensure j != i
+                else:
+                    j = i
+                
+                batch_loss = losses[i](
+                    (xs[i], xs[j]),
+                    (x_hats[i], x_hats[j]),
+                    (z_pres[i], z_pres[j]),
+                    (zs[i], zs[j]),
+                    model.get_dictionary(),
+                    f_E1=model.encode, f_D1=model.decode,
+                    f_E2=saes[j].encode, f_D2=saes[j].decode,
+                )
+                for k, v in batch_loss.items():
+                    plot_logs[f"sae_{i+1}/{len(saes)}"][k] = v.item() if isinstance(v, torch.Tensor) else v
+                
+                loss += batch_loss["total_loss"]
+            
+            run.log(
+                {f"{k1}/{k2}": v for k1, log_dict in plot_logs.items() for k2, v in log_dict.items()},
+                step=global_step,
+                # commit=True,
+            )
+
+            # init dead code tracker with first batch
+            if dead_trackers is None:
+                dead_trackers = [DeadCodeTracker(z.shape[1], device) for z in zs]
+            for dead_tracker, z in zip(dead_trackers, zs):
+                dead_tracker.update(z)
+
+            loss.backward()
+
+            if clip_grad:
+                for model in saes:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
+            for optimizer in optimizers:
+                optimizer.step()
+
+            if schedulers is not None:
+                for scheduler in schedulers:
+                    if scheduler is not None:
+                        scheduler.step()
+
+            # TODO : monitor with wandb to track all saes
+            if monitoring:
+                epoch_loss += loss.item()
+                epoch_error += torch.tensor([_compute_reconstruction_error(x, x_hat) for x, x_hat in zip(xs, x_hats)]).mean().item()
+                epoch_sparsity += torch.tensor([l0_eps(z, 0).sum().item() for z in zs]).mean().item()
+                # if verbose:
+                #     print(f"Epoch[{epoch+1}/{nb_epochs}], Batch[{batch_count}], Loss: {loss.item():.2e}, "
+                #             f"R2: {_compute_reconstruction_error(x, x_hat):.4f}, "
+                #             f"L0: {l0_eps(z, 0).sum().item():.4f}, "
+                #             f"Dead Features: {dead_tracker.get_dead_ratio()*100:.1f}%")
+                _log_metrics(monitoring, logs, model, z, loss, optimizer)
+            
+            progress_bar.set_description(
+                f"Epoch[{epoch+1}/{nb_epochs}], L: {loss.item():.2e}, "
+                f"R2: {torch.tensor([_compute_reconstruction_error(x, x_hat) for x, x_hat in zip(xs, x_hats)]).mean().item():.2f}, "
+                f"L0: {torch.tensor([l0_eps(z, 0).sum().item() for z in zs]).mean().item():.1f}, "
+                f"Dead: {torch.tensor([dead_tracker.get_dead_ratio() for dead_tracker in dead_trackers]).mean().item()*100:.1f}%"
+            )
+            
+            if N_tokens is not None and global_tokens >= N_tokens:
+                break
+
+        if monitoring and batch_count > 0:
+            avg_loss = epoch_loss / batch_count
+            avg_error = epoch_error / batch_count
+            avg_sparsity = epoch_sparsity / batch_count
+            dead_ratio = dead_tracker.get_dead_ratio()
+            epoch_duration = time.time() - start_time
+
+            logs['avg_loss'].append(avg_loss)
+            logs['r2'].append(avg_error)
+            logs['time_epoch'].append(epoch_duration)
+            logs['z_sparsity'].append(avg_sparsity)
+            logs['dead_features'].append(dead_ratio)
+
+            print(f"Epoch[{epoch+1}/{nb_epochs}], Loss: {avg_loss:.2e}, "
+                  f"R2: {avg_error:.4f}, L0: {avg_sparsity:.4f}, "
+                  f"Dead Features: {dead_ratio*100:.1f}%, "
+                  f"Time: {epoch_duration:.4f} seconds")
+        
+        if checkpoint_path is not None and (((epoch + 1) % checkpoint_interval == 0) or (epoch == nb_epochs - 1) or (N_tokens is not None and global_tokens >= N_tokens)):
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': [model.state_dict() for model in saes],
+                'optimizer_state_dict': [optimizer.state_dict() for optimizer in optimizers],
+                'scheduler_state_dict': [scheduler.state_dict() if scheduler else None for scheduler in schedulers] if schedulers is not None else None,
+                'logs': logs
+            }
+            full_checkpoint_path = os.path.join(checkpoint_path, checkpoint_name + f"_epoch_{epoch+1}" + ".pt")
+            dir_name = os.path.dirname(full_checkpoint_path)
+            if not os.path.exists(dir_name):
+                os.makedirs(dir_name)
+            torch.save(checkpoint, full_checkpoint_path)
+            
+            if best_loss is None or avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(checkpoint, full_checkpoint_path.replace(f"_epoch_{epoch+1}", ""))
+        
+        if N_tokens is not None and global_tokens >= N_tokens:
+            break
 
     return logs
 

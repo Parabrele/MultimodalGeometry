@@ -1,6 +1,9 @@
+from datetime import datetime
 import os, requests, zipfile, hashlib, random
 from io import BytesIO
+from webdataset import TarWriter
 import base64
+from copy import deepcopy
 
 from pathlib import Path
 import json
@@ -33,7 +36,7 @@ import plotly.io as pio
 from skimage.color import rgb2lab, lab2rgb
 
 from timm.data.dataset import ImageDataset
-from transformers import CLIPModel, CLIPProcessor, SiglipModel, SiglipProcessor, AutoProcessor, AutoModel
+from transformers import CLIPModel, CLIPProcessor, SiglipModel, SiglipProcessor, AutoProcessor, AutoModel, AutoImageProcessor, Dinov2Model
 from typing import Callable
 from dataclasses import dataclass, field
 
@@ -68,6 +71,7 @@ openclip_name = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 openclip_L_name = "laion/CLIP-ViT-L-14-laion2B-s32B-b82K"
 siglip_name = "google/siglip-base-patch16-224"
 siglip2_name = "google/siglip2-base-patch16-224"
+dinov2_name = "facebook/dinov2-base"
 
 def _get_model(model_name, device="cpu"):
         if model_name in [clip_name, clip_L_name, openclip_name, openclip_L_name]:
@@ -76,12 +80,23 @@ def _get_model(model_name, device="cpu"):
         if model_name in [siglip_name, siglip2_name]:
             model = SiglipModel.from_pretrained(model_name).to(device)
             processor = SiglipProcessor.from_pretrained(model_name)
+        if model_name in [dinov2_name]:
+            model = AutoModel.from_pretrained('facebook/dinov2-base').to(device)
+            processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
         model.eval()
-        max_length=model.config.text_config.max_position_embeddings
+        try:
+            max_length=model.config.max_position_embeddings
+        except:
+            max_length=None
         return model, processor, max_length
 
 @torch.no_grad()
 def _preprocess_img(img, model, processor, max_length):
+    # if model is dinov2, custom code :
+    if isinstance(model, Dinov2Model):
+        image_tensor = processor(images=img, return_tensors="pt")
+        img_feat = model(**image_tensor.to(model.device))[0][:, 0, :].cpu() # CLS token
+        return img_feat.squeeze()
     image_tensor = processor(images=img, return_tensors="pt")['pixel_values'].to(model.device)
     img_feat = model.get_image_features(pixel_values=image_tensor)
     img_feat /= img_feat.norm(dim=-1, keepdim=True)
@@ -95,12 +110,20 @@ def _preprocess_txt(txt, model, processor, max_length):
     return img_feat.squeeze()
 
 def get_coco(batch_size=512, device="cpu", model_name="openai/clip-vit-base-patch32"):
-    base_path = "./coco/embeddings/" + model_name
+    DEEL_coco_embeddings_path = "./coco/embeddings/"
+    BROWN_coco_embeddings_path = "/media/data_cifs/projects/prj_multimodal/coco/embeddings/"
+    base_path = BROWN_coco_embeddings_path + model_name
     img_path = os.path.join(base_path, "image_features.pt")
     txt_path = os.path.join(base_path, "text_features.pt")
     
-    annFile = '/datasets/shared_datasets/coco/annotations/captions_train2017.json'
-    image_dir = '/datasets/shared_datasets/coco/train2017'
+    DEEL_annFile = '/datasets/shared_datasets/coco/annotations/captions_train2017.json'
+    BROWN_annFile = '/media/data_cifs/projects/prj_multimodal/coco/annotations/captions_train2017.json'
+    annFile = BROWN_annFile
+    
+    DEEL_image_dir = '/datasets/shared_datasets/coco/train2017'
+    BROWN_image_dir = '/media/data_cifs/projects/prj_multimodal/coco/train2017'
+    image_dir = BROWN_image_dir
+    
     coco = COCO(annFile)
 
     # Prepare image-caption pairs
@@ -236,25 +259,126 @@ def _download_laion(data_dir="/datasets/shared_datasets/LAION400M/"):
         json.dump(caption_dict, f, indent=4)
 
     print(f"Downloaded {len(caption_dict)} images out of {max_items} requested.")
-
-def get_laion(batch_size=512, device="cpu", model_name="openai/clip-vit-base-patch32", data_dir="/datasets/shared_datasets/LAION400M/embeddings/CLIP/"):
-    # Load dataset with token
-    max_items=1_000_000
-    ds_streamed = load_dataset("laion/laion400m", split="train", streaming=True)
     
-    base_path = "./laion/embeddings/" + model_name
+DEEL_laion_path = "/datasets/shared_datasets/LAION400M/"
+BROWN_laion_path = "/media/data_cifs/projects/prj_multimodal/LAION400M/"
+
+@torch.no_grad()
+def get_laion(batch_size=512, device="cpu", model_name="openai/clip-vit-base-patch32", data_dir=BROWN_laion_path, vision_only=False, max_items=1_000_000):
+    # Load dataset with token
+    print("Loading LAION dataset...")
+    ds_streamed = load_dataset("laion/laion400m", split="train", streaming=True)
+    print("LAION dataset loaded.")
+    
+    base_path = data_dir + "embeddings/" + model_name
     img_path = os.path.join(base_path, "image_features.pt")
     txt_path = os.path.join(base_path, "text_features.pt")
     
+    print("entering try block")
     try:
         image_features = torch.load(img_path, map_location="cpu").to(device)
-        text_features = torch.load(txt_path, map_location="cpu").to(device)
-    except FileNotFoundError:        
+        if not vision_only:
+            text_features = torch.load(txt_path, map_location="cpu").to(device)
+    except FileNotFoundError:
+        print("Files not found, processing dataset...")
         model, processor, max_length = _get_model(model_name, device=device)
         
         image_features = [None] * max_items
         text_features = [None] * max_items
         
+        queue = asyncio.Queue(maxsize=4*batch_size)
+
+        async def producer(session, dataset, sem, pbar, max_items):
+            tasks = []
+
+            async def fetch_one(i, url, caption):
+                async with sem:
+                    try:
+                        async with session.get(url, timeout=10) as resp:
+                            if resp.status == 200:
+                                img = Image.open(BytesIO(await resp.read()))
+                                if img.mode != 'RGB':
+                                    img = img.convert('RGB')
+                                if 1 in img.size:
+                                    raise ValueError("Image too small")
+                                await queue.put([img, caption, i])
+                    except Exception:
+                        pass
+                    finally:
+                        pbar.update(1)
+
+            for i, item in enumerate(dataset):
+                if i >= max_items:
+                    break
+                url = item.get("URL") or item.get("url")
+                caption = item.get("caption")
+                if not url:
+                    pbar.update(1)
+                    continue
+                tasks.append(asyncio.create_task(fetch_one(i, url, caption)))
+
+            # wait for all downloads to finish
+            await asyncio.gather(*tasks)
+            await queue.put(None)
+
+        async def consumer(model, processor, max_length, image_features, text_features, batch_size=512):
+            batch = []
+            while True:
+                item = await queue.get()
+                if item is None:  # producer finished
+                    if batch:
+                        await asyncio.to_thread(
+                            process_batch, batch, model, processor, max_length, image_features, text_features
+                        )
+                    break
+                batch.append(item)
+                if len(batch) >= batch_size:
+                    await asyncio.to_thread(
+                        process_batch, batch, model, processor, max_length, image_features, text_features
+                    )
+                    batch.clear()
+                queue.task_done()
+
+        def process_batch(batch, model, processor, max_length, image_features, text_features):
+            imgs, captions, indices = zip(*batch)
+            imgs, captions, indices = list(imgs), list(captions), list(indices)
+            try:
+                img_feats = _preprocess_img(imgs, model, processor, max_length)
+                if not vision_only:
+                    txt_feats = _preprocess_txt(list(captions), model, processor, max_length)
+                    for idx, img_f, txt_f in zip(indices, img_feats, txt_feats):
+                        image_features[idx] = img_f
+                        text_features[idx] = txt_f
+                else:
+                    for idx, img_f in zip(indices, img_feats):
+                        image_features[idx] = img_f
+            except Exception:
+                print("Warning: code 663431 ! I repeat: code 663431 !")
+            
+        async def main(dataset, model, processor, max_length, max_items, concurrency):
+            sem = asyncio.Semaphore(concurrency)
+            pbar = tqdm(total=max_items, desc="Downloading images")
+            async with aiohttp.ClientSession() as session:
+                producer_task = asyncio.create_task(producer(session, dataset, sem, pbar, max_items))
+                consumer_task = asyncio.create_task(consumer(model, processor, max_length, image_features, text_features))
+                await asyncio.gather(producer_task, consumer_task)
+            pbar.close()
+        
+        nest_asyncio.apply()
+
+        async def runner():
+            await main(
+                ds_streamed,
+                model=model,
+                processor=processor,
+                max_length=max_length,
+                max_items=max_items,
+                concurrency=512,  # or whatever you want
+            )
+
+        asyncio.run(runner())
+        
+        """
         async def download_image(session, url, pbar, sem, caption, idx):
             async with sem:
                 try:
@@ -297,22 +421,23 @@ def get_laion(batch_size=512, device="cpu", model_name="openai/clip-vit-base-pat
      
         nest_asyncio.apply()
         asyncio.run(runner())
+        """
         
         not_none_indices = [i for i, img in enumerate(image_features) if img is not None]
         
         image_features = [image_features[i] for i in not_none_indices]
         image_features = torch.stack(image_features).to(device)
         
-        text_features = [text_features[i] for i in not_none_indices]
-        text_features = torch.stack(text_features).to(device)
+        if not vision_only:
+            text_features = [text_features[i] for i in not_none_indices]
+            text_features = torch.stack(text_features).to(device)
         
-        print(f"Image features shape: {image_features.shape}, memory: {image_features.element_size() * image_features.nelement() / 1024**2:.2f} MB")
-        print(f"Text features shape: {text_features.shape}, memory: {text_features.element_size() * text_features.nelement() / 1024**2:.2f} MB")
         os.makedirs(base_path, exist_ok=True)
         torch.save(image_features.cpu(), img_path)
-        torch.save(text_features.cpu(), txt_path)
+        if not vision_only:
+            torch.save(text_features.cpu(), txt_path)
     
-    dataset = torch.utils.data.TensorDataset(image_features, text_features)
+    dataset = torch.utils.data.TensorDataset(image_features, text_features) if not vision_only else torch.utils.data.TensorDataset(image_features)
     train_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     """
@@ -357,6 +482,127 @@ def get_laion(batch_size=512, device="cpu", model_name="openai/clip-vit-base-pat
     """
 
     return train_loader
+
+def get_laion_raw(target_nb_samples=int(10_000_000*4/3), samples_per_shard=10_000, data_dir=BROWN_laion_path, concurrency=512):
+    # Download and save LAION images.
+    # - Save metadata to keep track of (id, shard, cap, url), where
+    #     - id : unique identifier for each image-caption pair
+    #     - shard : shard index where the actual image is stored
+    #     - cap : caption text
+    #     - url : image URL
+    # - Save sharded images to avoid overloading filesystem
+    ds_streamed = load_dataset("laion/laion400m", split="train", streaming=True)
+    
+    queue = asyncio.Queue(maxsize=4096) # store a maximum of 4096 in the producer queue. If more than that are produced, the producer waits for the consumer to catch up.
+    metadata = []
+    
+    async def producer(session, dataset, sem, pbar, max_items):
+        tasks = []
+
+        async def fetch_one(i, url, caption):
+            async with sem:
+                try:
+                    async with session.get(url, timeout=10) as resp:
+                        if resp.status != 200:
+                            raise ValueError("Non-200 response")
+                        data = await resp.read()
+                        img = Image.open(BytesIO(data))
+                        img.load()
+                        
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        
+                        w, h = img.size
+                        if w < 2 or h < 2:
+                            raise ValueError("Image too small")
+                        
+                        await queue.put([img, caption, i, url])
+                except Exception:
+                    pass
+                finally:
+                    pbar.update(1)
+
+        for i, item in enumerate(dataset):
+            if i >= max_items:
+                break
+            url = item.get("URL") or item.get("url")
+            caption = item.get("caption")
+            if not isinstance(caption, str) or len(caption.strip()) == 0:
+                pbar.update(1)
+                continue
+            if not url:
+                pbar.update(1)
+                continue
+            tasks.append(asyncio.create_task(fetch_one(i, url, caption)))
+
+        # wait for all downloads to finish
+        await asyncio.gather(*tasks)
+        await queue.put(None)
+        
+    async def consumer():
+        batch = []
+        shard_idx = 0
+        shard_dir = Path(data_dir) / "images_sharded/"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        
+        def write_shard(shard_idx, batch):
+            shard_path = shard_dir / f"{shard_idx:06d}.tar"
+            with TarWriter(str(shard_path)) as tw:
+                for img, caption, i, url in batch:
+                    sample_key = f"{i:09d}"
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=95)
+                    tw.write({
+                        "__key__": sample_key,
+                        "jpg": buf.getvalue(),
+                    })
+        
+        while True:
+            item = await queue.get()
+            if item is None:  # producer finished
+                if batch:
+                    # shard the remaining images
+                    write_shard(shard_idx, batch)
+                break
+            batch.append(item)
+            metadata.append((item[2], shard_idx, item[1], item[3]))  # (id, shard, cap, url)
+            if len(batch) >= samples_per_shard:
+                # shard the images in the batch
+                print(f"Writing shard {shard_idx} with {len(batch)} samples. Id of last sample: {batch[-1][2]}")
+                write_shard(shard_idx, batch)
+                shard_idx += 1
+                batch.clear()
+            queue.task_done()
+    
+    async def main(dataset, concurrency):
+        sem = asyncio.Semaphore(concurrency)
+        pbar = tqdm(total=target_nb_samples, desc="Downloading images")
+        async with aiohttp.ClientSession() as session:
+            producer_task = asyncio.create_task(producer(session, dataset, sem, pbar, target_nb_samples))
+            consumer_task = asyncio.create_task(consumer())
+            await asyncio.gather(producer_task, consumer_task)
+        pbar.close()
+    
+    nest_asyncio.apply()
+
+    async def runner():
+        await main(
+            ds_streamed,
+            concurrency=concurrency,
+        )
+
+    asyncio.run(runner())
+    
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    meta_path = Path(data_dir) / "metadata"
+    meta_path.mkdir(exist_ok=True, parents=True)
+
+    df = pd.DataFrame(metadata, columns=["id", "shard", "caption", "url"])
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, meta_path / "laion_metadata.parquet")
 
 def _load_laion_dataset(data_dir):
     img_emb_dir = os.path.join(data_dir, "img_emb")
@@ -658,24 +904,29 @@ imagenet_templates = [
     'a tattoo of the {}.',
 ]
 
-def get_imagenet(batch_size=512, model_name=clip_name, split="test", device="cpu", shuffle=False):
-    base_path = "./imagenet/embeddings/" + model_name
+def get_imagenet(batch_size=512, model_name=clip_name, split="test", device="cpu", shuffle=False, vision_only=False):
+    DEEL_imagenet_embeddings_path = "./imagenet/embeddings/"
+    BROWN_imagenet_embeddings_path = "/media/data_cifs/projects/multimodal/imagenet/embeddings/"
+    base_path = BROWN_imagenet_embeddings_path + model_name
     train_path = 'train.pt'
     test_path = 'test.pt'
     if split == "train":
         file_path = os.path.join(base_path, train_path)
     elif split == "test" or split == "val":
         file_path = os.path.join(base_path, test_path)
-    classes_path = os.path.join(base_path, "classes.pt")
+    
+    if not vision_only:
+        classes_path = os.path.join(base_path, "classes.pt")
     
     class ImageNetDataset(ImageDataset):
         def __init__(self, path: str, transforms: Callable, **kwargs):
+            print(f"Loading ImageNet dataset from {path}...")
             super(ImageNetDataset, self).__init__(path, **kwargs)
             self.transforms = transforms
 
         def __getitem__(self, item):
             img, label = super(ImageNetDataset, self).__getitem__(item)
-            img = self.transforms(img)
+            # img = self.transforms(img)
 
             return img, label
     
@@ -684,7 +935,8 @@ def get_imagenet(batch_size=512, model_name=clip_name, split="test", device="cpu
     try:
         image_features, labels = torch.load(file_path, map_location='cpu')
         found_img_file = True
-        classes_features = torch.load(classes_path, map_location='cpu').to(device)
+        if not vision_only:
+            classes_features = torch.load(classes_path, map_location='cpu').to(device)
         found_classes_file = True
     except FileNotFoundError:
         print(base_path)
@@ -693,31 +945,75 @@ def get_imagenet(batch_size=512, model_name=clip_name, split="test", device="cpu
         model, processor, max_length = _get_model(model_name, device=device)
 
         if not found_img_file:
+            DEEL_imagenet_data_path = '/datasets/shared_datasets/imagenet/ILSVRC/Data/CLS-LOC/' + ('train' if split == "train" else "val")
+            BROWN_imagenet_data_path = '/media/data_cifs/projects/prj_video_imagenet/imagenet/ILSVRC/Data/CLS-LOC/' + ('train' if split == "train" else "val2")
             _dataset = ImageNetDataset(
-                '/datasets/shared_datasets/imagenet/ILSVRC/Data/CLS-LOC/' + ('train' if split == "train" else "val"),
+                BROWN_imagenet_data_path,
                 partial(_preprocess_img, model=model, processor=processor, max_length=max_length),
             )
-        
-            with torch.no_grad():
-                _loader = torch.utils.data.DataLoader(_dataset, batch_size=256, shuffle=False)
+            loader = torch.utils.data.DataLoader(
+                _dataset,
+                batch_size=None,          # single samples
+                shuffle=False,
+                num_workers=os.cpu_count() // 2,  # parallel I/O
+                pin_memory=True
+            )
 
-                my_big_tensor = []
-                all_labels = []
-                for images, labels in tqdm(_loader, desc=f"Processing {split} Set"):
-                    my_big_tensor.append(images)
-                    all_labels.append(labels)
+            queue = asyncio.Queue(maxsize=32)
+            
+            async def producer(pbar):
+                for i, (img, label) in enumerate(loader):
+                    await queue.put((i, img, label))
+                    pbar.update(1)
+                await queue.put((None, None, None))
+            
+            async def consumer():
+                my_big_tensor, all_labels = [], []
+                batch_imgs, batch_labels = [], []
+                preprocess_fct = partial(_preprocess_img, model=model, processor=processor, max_length=max_length)
+                while True:
+                    i, img, label = await queue.get()
+                    if i is None:
+                        if batch_imgs:
+                            imgs_tensor = preprocess_fct(batch_imgs)
+                            my_big_tensor.append(imgs_tensor)
+                            all_labels.append(torch.tensor(batch_labels))
+                        break
+                    batch_imgs.append(img)
+                    batch_labels.append(label)
+                    if len(batch_imgs) >= batch_size:
+                        imgs_tensor = preprocess_fct(batch_imgs)
+                        my_big_tensor.append(imgs_tensor)
+                        all_labels.append(torch.tensor(batch_labels))
+                        batch_imgs, batch_labels = [], []
+                    queue.task_done()
                 image_features = torch.cat(my_big_tensor, dim=0)
                 labels = torch.cat(all_labels, dim=0)
+                return image_features, labels
+            
+            with torch.no_grad():
+                nest_asyncio.apply()
+                async def runner():
+                    pbar = tqdm(total=len(_dataset), desc="Processing ImageNet images")
+                    prod_task = asyncio.create_task(producer(pbar))
+                    cons_task = asyncio.create_task(consumer())
+                    await asyncio.gather(prod_task, cons_task)
+                    pbar.close()
+                    return cons_task.result()
+                image_features, labels = asyncio.run(runner())
+                print(image_features.shape)
                 print("File path :", file_path)
                 torch.save((image_features, labels), file_path)
         
-        if not found_classes_file:
+        if (not found_classes_file) and (not vision_only):
 
             def get_class_to_idx(path):
                 subdirs = sorted([p.name for p in Path(path).iterdir() if p.is_dir()])
                 return {name: idx for idx, name in enumerate(subdirs)}
 
-            class_to_idx = get_class_to_idx('/datasets/shared_datasets/imagenet/ILSVRC/Data/CLS-LOC/val')
+            DEEL_class_to_idx_path = '/datasets/shared_datasets/imagenet/ILSVRC/Data/CLS-LOC/val'
+            BROWN_class_to_idx_path = '/media/data_cifs/projects/prj_video_imagenet/imagenet/ILSVRC/Data/CLS-LOC/val2'
+            class_to_idx = get_class_to_idx(BROWN_class_to_idx_path)
             idx_to_class = {v: k for k, v in class_to_idx.items()}
             
             url = "https://storage.googleapis.com/download.tensorflow.org/data/imagenet_class_index.json"
@@ -782,6 +1078,8 @@ def get_imagenet(batch_size=512, model_name=clip_name, split="test", device="cpu
     # plot_images_with_labels(data, num_images=5)
     """
     
+    if vision_only:
+        return train_loader
     return train_loader, classes_features
 
 def get_fashionIQ(batch_size=512, model_name=clip_name, device="cpu", split="train"):
@@ -988,7 +1286,6 @@ def get_fashionIQ(batch_size=512, model_name=clip_name, device="cpu", split="tra
     """
     
     return candidate_features, target_features, text_features
-        
 
 ##########
 # Miscellaneous
@@ -996,7 +1293,220 @@ def get_fashionIQ(batch_size=512, model_name=clip_name, device="cpu", split="tra
 
 supported_archi = ["ReLU", "relu", "JumpReLU", "jumprelu", "TopK", "topk", "BatchTopK", "batchtopk", "MP", "mp"]
 
-def _train(beta, train_loader, model_name, force_retrain=False, save_quand_meme=False, criterion_2_fct=None, d_model=512, expansion_factor=8, top_k=20, lr=5e-4, epochs=5, archi="MP", mean=False, dataset_name="laion", device="cpu"):
+def initialize_dictionary(archi, top_k, d_model, nb_concepts, maxialpha, batch_size, device="cpu"):
+    normalisation = 'identity'
+    if archi in ["ReLU", "relu"]:
+        sae = overcomplete.sae.SAE(d_model, nb_concepts=nb_concepts, device=device, dictionary_params={'normalization': normalisation})
+        alpha = 0.0
+        desired_sparsity = top_k / nb_concepts
+        update_rate = 0.001  # how aggressively alpha changes
+
+        def update_alpha(alpha, current_sparsity, target_sparsity):
+            current_sparsity = max(current_sparsity, 1e-12)
+            target_sparsity = max(target_sparsity, 1e-12)
+            
+            # Adjust (on log scale, since sparsity starts very large and ends very small, when it goes below the target, the update steps in non log scale are too small)
+            ratio = current_sparsity / target_sparsity
+            alpha *= np.exp(update_rate * np.log(ratio))
+            return max(alpha, 1e-12)
+
+        def _criterion(x, x_hat, pre_codes, codes, dictionary, *args, **kwargs):
+            if isinstance(codes, tuple):
+                codes, _ = codes
+                x, _ = x
+                x_hat, _ = x_hat
+                pre_codes, _ = pre_codes
+                n = codes.shape[0]
+            elif isinstance(codes, torch.Tensor):
+                assert codes.shape[0] % 2 == 0, "batch size must be even"
+                n = codes.shape[0] // 2
+                codes = codes[:n] # shape: (n, d)
+                x = x[:n]
+                x_hat = x_hat[:n]
+                pre_codes = pre_codes[:n]
+            else:
+                raise ValueError("codes must be either a tuple of two tensors or a single tensor")
+    
+            loss = (x - x_hat).square().mean()
+            current_sparsity = (codes > 0).float().mean().item()
+
+            sparsity_loss = codes.abs().mean()
+            
+            is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
+            reanim_loss = (pre_codes * is_dead[None, :]).mean()
+
+            loss += sparsity_loss * maxialpha.alpha - reanim_loss * 1e-3
+
+            maxialpha.alpha = update_alpha(maxialpha.alpha, current_sparsity, desired_sparsity)
+            return loss
+        criterion_1 = lambda *args, **kwargs: _criterion(*args, **kwargs)
+    elif archi in ["JumpReLU", "jumprelu"]:
+        sae = overcomplete.sae.JumpSAE(d_model, nb_concepts=nb_concepts, device=device, dictionary_params={'normalization': normalisation})
+        alpha = 0.0
+        desired_sparsity = top_k / nb_concepts
+        def _criterion(x, x_hat, pre_codes, codes, dictionary, *args, **kwargs):
+            # here we directly use the thresholds of the model to control the sparsity
+            if isinstance(codes, tuple):
+                codes, _ = codes
+                x, _ = x
+                x_hat, _ = x_hat
+                pre_codes, _ = pre_codes
+                n = codes.shape[0]
+            elif isinstance(codes, torch.Tensor):
+                assert codes.shape[0] % 2 == 0, "batch size must be even"
+                n = codes.shape[0] // 2
+                codes = codes[:n] # shape: (n, d)
+                x = x[:n]
+                x_hat = x_hat[:n]
+                pre_codes = pre_codes[:n]
+            else:
+                raise ValueError("codes must be either a tuple of two tensors or a single tensor")
+    
+            loss = (x - x_hat).square().mean()
+
+            sparsity = (codes > 0).float().mean().detach()
+            if sparsity > desired_sparsity:
+                # if we are not sparse enough, increase the thresholds levels
+                loss -= sae.thresholds.sum()
+            
+            is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
+            # we push the pre_codes (before relu) towards the positive orthant
+            reanim_loss = (pre_codes * is_dead[None, :]).mean()
+
+            loss -= reanim_loss * 1e-3
+
+            return loss
+        criterion_1 = lambda *args, **kwargs: _criterion(*args, **kwargs)
+    elif archi in ["TopK", "topk"]: 
+        sae = overcomplete.sae.TopKSAE(d_model, nb_concepts=nb_concepts, top_k=top_k, device=device, dictionary_params={'normalization': normalisation})
+        alpha = 1e-3  # Dead features loss penalty
+        def _criterion(x, x_hat, pre_codes, codes, dictionary, *args, **kwargs):
+            # here we directly use the thresholds of the model to control the sparsity
+            if isinstance(codes, tuple):
+                codes, _ = codes
+                x, _ = x
+                x_hat, _ = x_hat
+                pre_codes, _ = pre_codes
+                n = codes.shape[0]
+            elif isinstance(codes, torch.Tensor):
+                assert codes.shape[0] % 2 == 0, "batch size must be even"
+                n = codes.shape[0] // 2
+                codes = codes[:n] # shape: (n, d)
+                x = x[:n]
+                x_hat = x_hat[:n]
+                pre_codes = pre_codes[:n]
+            else:
+                raise ValueError("codes must be either a tuple of two tensors or a single tensor")
+    
+            loss = (x - x_hat).square().mean()
+
+            is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
+            # we push the pre_codes (before relu) towards the positive orthant
+            reanim_loss = (pre_codes * is_dead[None, :]).mean()
+
+            loss -= reanim_loss * alpha
+
+            return loss
+        criterion_1 = _criterion
+    elif archi in ["BatchTopK", "batchtopk"]:
+        top_k_individual = top_k
+        sae = overcomplete.sae.BatchTopKSAE(d_model, nb_concepts=nb_concepts, top_k=top_k_individual*batch_size, device=device, dictionary_params={'normalization': normalisation})
+        alpha = 1e-3  # Dead features loss penalty
+        def _criterion(x, x_hat, pre_codes, codes, dictionary, *args, **kwargs):
+            if isinstance(codes, tuple):
+                codes, _ = codes
+                x, _ = x
+                x_hat, _ = x_hat
+                pre_codes, _ = pre_codes
+                n = codes.shape[0]
+            elif isinstance(codes, torch.Tensor):
+                assert codes.shape[0] % 2 == 0, "batch size must be even"
+                n = codes.shape[0] // 2
+                codes = codes[:n] # shape: (n, d)
+                x = x[:n]
+                x_hat = x_hat[:n]
+                pre_codes = pre_codes[:n]
+            else:
+                raise ValueError("codes must be either a tuple of two tensors or a single tensor")
+    
+            # here we directly use the thresholds of the model to control the sparsity
+            loss = (x - x_hat).square().mean() / (x.square().mean() + 1e-8)
+
+            is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
+            # we push the pre_codes (before relu) towards the positive orthant
+            reanim_loss = (pre_codes * is_dead[None, :]).mean()
+
+            loss -= reanim_loss * alpha
+            
+            return loss
+        criterion_1 = _criterion
+    elif archi in ["MP", "mp"]:
+        sae = overcomplete.sae.MpSAE(d_model, nb_concepts=nb_concepts, k=top_k, device=device, dictionary_params={'normalization': normalisation})
+        alpha = 0.0 # L1 penalty
+        criterion_1 = lambda *args, **kwargs: losses.mse_l1(*args, **kwargs, penalty=alpha)
+    else:
+        raise ValueError(f"Unsupported architecture: {archi}. Supported architectures: {supported_archi}")
+    return sae, criterion_1, alpha
+
+class SAE_loss:
+    def __init__(self,
+                 reconstruction_loss=None, # used for the demi-cycle consistency loss. If None, will use mse_loss.
+                 alpha_tr=0., # Primary loss : translation reconstruction loss - requires matching pairs - supervised
+                 alpha_cont=0., # Primary loss : contrastive loss - requires matching pairs - supervised
+                 alpha_IsoE=0., # Secondary loss : IsoE loss - does not require matching pairs - self supervised
+                 alpha_dcy=1., # Secondary loss : demi-cycle consistency loss (= reconstruction)
+                               #                  does not require matching pairs - self supervised
+                               # This will be the reconstruction_loss.
+                 alpha_cy=0., # Secondary loss : cycle consistency loss - does not require matching pairs - self supervised
+                 ):
+        self.reconstruction_loss = reconstruction_loss if reconstruction_loss is not None else lambda *args, **kwargs: losses.mse_loss(*args, **kwargs, penalty=1e-3)
+        self.alpha_tr = alpha_tr
+        self.alpha_cont = alpha_cont
+        self.alpha_IsoE = alpha_IsoE
+        self.alpha_dcy = alpha_dcy
+        self.alpha_cy = alpha_cy
+    
+    def __call__(self, *args, **kwargs):
+        # don't compute the losses that will be multiplied by 0.
+        l_tr = losses.tr_loss(*args, **kwargs) if self.alpha_tr > 0 else 0.
+        l_cont = losses.cont_loss(*args, **kwargs) if self.alpha_cont > 0 else 0.
+        l_dcy = self.reconstruction_loss(*args, **kwargs) if self.alpha_dcy > 0 else 0.
+        l_cy = losses.cy_loss(*args, **kwargs) if self.alpha_cy > 0 else 0.
+        l_IsoE = losses.IsoE_loss(*args, **kwargs) if self.alpha_IsoE > 0 else 0.
+
+        return {
+            "tr_loss": l_tr,
+            "cont_loss": l_cont,
+            "dcy_loss": l_dcy,
+            "cy_loss": l_cy,
+            "IsoE_loss": l_IsoE,
+            "total_loss": (
+            l_tr   * self.alpha_tr +
+            l_cont * self.alpha_cont +
+            l_dcy  * self.alpha_dcy +
+            l_cy   * self.alpha_cy +
+            l_IsoE * self.alpha_IsoE
+        )}
+
+def load_sae(sae_name, archi, top_k, d_model, expansion_factor, device="cpu"):
+    nb_concepts = d_model * expansion_factor
+    sae, _, _ = initialize_dictionary(
+        archi, top_k, d_model, nb_concepts, None, 1, 
+        device=device
+    )
+    sae.to(device)
+    sae.eval()
+    something = torch.load(f"./checkpoints/{sae_name}.pt", weights_only=False)
+    sae_state_dict = something['model_state_dict']
+    sae.load_state_dict(sae_state_dict)
+    sae = sae.to(device)
+    sae.train().eval()
+    return sae
+
+def _train(beta, train_loader, model_name, d_model=512, expansion_factor=8, top_k=20, lr=5e-4, epochs=5, archi="MP", dataset_name="laion", device="cpu", force_retrain=False, save_quand_meme=False, criterion_2_fct=None):
+    vision_only = False
+    if model_name in [dinov2_name]:
+        vision_only = True
     nb_concepts = d_model * expansion_factor
     
     batch_size = train_loader.batch_size
@@ -1008,97 +1518,11 @@ def _train(beta, train_loader, model_name, force_retrain=False, save_quand_meme=
         def __init__(self, alpha=1e-3):
             self.alpha = alpha
     maxialpha = mouahahaIvenoideawhyglobaldoesntworksoletsdoanobject(alpha=1e-3)
-    def whydoIdoThis():
-        if archi in ["ReLU", "relu"]:
-            sae = overcomplete.sae.SAE(d_model, nb_concepts=nb_concepts, device=device)
-            alpha = 0.0
-            desired_sparsity = top_k / nb_concepts
-            update_rate = 0.001  # how aggressively alpha changes
 
-            def update_alpha(alpha, current_sparsity, target_sparsity):
-                current_sparsity = max(current_sparsity, 1e-12)
-                target_sparsity = max(target_sparsity, 1e-12)
-                
-                # Adjust (on log scale, since sparsity starts very large and ends very small, when it goes below the target, the update steps in non log scale are too small)
-                ratio = current_sparsity / target_sparsity
-                alpha *= np.exp(update_rate * np.log(ratio))
-                return max(alpha, 1e-12)
-
-            def _criterion(x, x_hat, pre_codes, codes, dictionary):
-                loss = (x - x_hat).square().mean()
-                current_sparsity = (codes > 0).float().mean().item()
-
-                sparsity_loss = codes.abs().mean()
-                
-                is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
-                reanim_loss = (pre_codes * is_dead[None, :]).mean()
-
-                loss += sparsity_loss * maxialpha.alpha - reanim_loss * 1e-3
-
-                maxialpha.alpha = update_alpha(maxialpha.alpha, current_sparsity, desired_sparsity)
-                return loss
-            criterion_1 = lambda *args, **kwargs: _criterion(*args, **kwargs)
-        elif archi in ["JumpReLU", "jumprelu"]:
-            sae = overcomplete.sae.JumpSAE(d_model, nb_concepts=nb_concepts, device=device)
-            alpha = 0.0
-            desired_sparsity = top_k / nb_concepts
-            def _criterion(x, x_hat, pre_codes, codes, dictionary):
-                # here we directly use the thresholds of the model to control the sparsity
-                loss = (x - x_hat).square().mean()
-
-                sparsity = (codes > 0).float().mean().detach()
-                if sparsity > desired_sparsity:
-                    # if we are not sparse enough, increase the thresholds levels
-                    loss -= sae.thresholds.sum()
-                
-                is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
-                # we push the pre_codes (before relu) towards the positive orthant
-                reanim_loss = (pre_codes * is_dead[None, :]).mean()
-
-                loss -= reanim_loss * 1e-3
-
-                return loss
-            criterion_1 = lambda *args, **kwargs: _criterion(*args, **kwargs)
-        elif archi in ["TopK", "topk"]: 
-            sae = overcomplete.sae.TopKSAE(d_model, nb_concepts=nb_concepts, top_k=top_k, device=device)
-            alpha = 1e-3  # Dead features loss penalty
-            def _criterion(x, x_hat, pre_codes, codes, dictionary):
-                # here we directly use the thresholds of the model to control the sparsity
-                loss = (x - x_hat).square().mean()
-
-                is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
-                # we push the pre_codes (before relu) towards the positive orthant
-                reanim_loss = (pre_codes * is_dead[None, :]).mean()
-
-                loss -= reanim_loss * alpha
-
-                return loss
-            criterion_1 = _criterion
-        elif archi in ["BatchTopK", "batchtopk"]:
-            top_k_individual = top_k * 2
-            sae = overcomplete.sae.BatchTopKSAE(d_model, nb_concepts=nb_concepts, top_k=top_k_individual*batch_size, device=device)
-            alpha = 1e-3  # Dead features loss penalty
-            def _criterion(x, x_hat, pre_codes, codes, dictionary):
-                # here we directly use the thresholds of the model to control the sparsity
-                loss = (x - x_hat).square().mean()
-
-                is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
-                # we push the pre_codes (before relu) towards the positive orthant
-                reanim_loss = (pre_codes * is_dead[None, :]).mean()
-
-                loss -= reanim_loss * alpha
-
-                return loss
-            criterion_1 = _criterion
-        elif archi in ["MP", "mp"]:
-            sae = overcomplete.sae.MpSAE(d_model, nb_concepts=nb_concepts, k=top_k, device=device)
-            alpha = 0.0 # L1 penalty
-            criterion_1 = lambda *args, **kwargs: overcomplete.sae.losses.mse_l1(*args, **kwargs, penalty=alpha)
-        else:
-            raise ValueError(f"Unsupported architecture: {archi}. Supported architectures: {supported_archi}")
-        return sae, criterion_1, alpha
-    
-    sae, criterion_1, alpha = whydoIdoThis()
+    sae, criterion_1, alpha = initialize_dictionary(
+        archi, top_k, d_model, nb_concepts, maxialpha, batch_size, 
+        vision_only=vision_only, device=device
+    )
 
     sae.to(device)
     sae.train()
@@ -1122,66 +1546,117 @@ def _train(beta, train_loader, model_name, force_retrain=False, save_quand_meme=
 
     CENTER_DATASET = False if 'CENTER_DATASET' not in locals() else CENTER_DATASET
     sae_name = model_name + "/"
-    sae_name += f"{dataset_name}_{archi}_centered_{CENTER_DATASET}" + ("_mean_" if mean else "") + f"_{expansion_factor}_L0_{top_k}_alpha" + alpha_name + "beta" + beta_name + ".pt"
+    sae_name += f"{dataset_name}_{archi}_centered_{CENTER_DATASET}" + f"_{expansion_factor}_L0_{top_k}_alpha" + alpha_name + "beta" + beta_name + ""
     print(f"Model name: {sae_name}")
 
     found_one = False
     try:
         _sae = None
-        something = torch.load(f"./checkpoints/{sae_name}", weights_only=False)
+        something = torch.load(f"./checkpoints/{sae_name}.pt", weights_only=False)
         if force_retrain:
             found_one = True
             raise FileNotFoundError("Forcing retraining of the model.")
-        _top_k = top_k + (1 if mean else 0)
-        _nb_concepts = nb_concepts + (2 if mean else 0)
         
-        _sae, _, _ = whydoIdoThis()
+        _sae, _, _ = initialize_dictionary(
+            archi, top_k, d_model, nb_concepts, maxialpha, batch_size, 
+            vision_only=vision_only, device=device
+        )
         
         sae_state_dict = something['model_state_dict']
         _sae.load_state_dict(sae_state_dict)
         _sae = _sae.to(device)
         logs = None # something['logs']
     except FileNotFoundError:
-        if mean:
-            x0, x1 = train_loader.dataset.tensors
-            m0 = x0.mean(dim=0, keepdim=True)
-            m1 = x1.mean(dim=0, keepdim=True)
-            x0 -= m0
-            x1 -= m1
-            train_loader.dataset.tensors = (x0, x1)
-            
         checkpoint_path = "./checkpoints" if (save_quand_meme or (not found_one)) else None
         logs = train.train_multimodal_sae(
             sae, train_loader, criterion, optimizer, scheduler=scheduler, nb_epochs=epochs, device=device,
             monitoring=1, verbose=True,
             checkpoint_path=checkpoint_path,
             checkpoint_interval=5, checkpoint_name=sae_name,
+            vision_only=vision_only,
         )
-        if mean:
-            x0, x1 = train_loader.dataset.tensors
-            x0 += m0
-            x1 += m1
-            train_loader.dataset.tensors = (x0, x1)
-
-            sae.k += 1
-            sae.nb_concepts += 2
-            sae.dictionary.nb_concepts += 2
-            m0 = m0.to(sae.dictionary._weights.device) / m0.norm().item()
-            m1 = m1.to(sae.dictionary._weights.device) / m1.norm().item()
-            sae.dictionary._weights.data = torch.cat([sae.dictionary._weights.data, m0, m1], dim=0)
-            if checkpoint_path is not None:
-                checkpoint = {
-                    'model_state_dict': sae.state_dict(),
-                }
-                full_checkpoint_path = os.path.join(checkpoint_path, sae_name)
-                dir_name = os.path.dirname(full_checkpoint_path)
-                if not os.path.exists(dir_name):
-                    os.makedirs(dir_name)
-                torch.save(checkpoint, full_checkpoint_path)
     if _sae is not None:
         sae = _sae
     sae.eval()
     return sae, sae_name, logs
+
+def _train_cycle_isoE(loss, train_loaders,
+                      model_name, d_model=512,
+                      expansion_factor=8, top_k=20, archi="MP",
+                      lr=5e-4, epochs=5, N_tokens=None, batch_size=None, dataset_name="laion",
+                      device="cpu", run=None,
+                      shared_init=False,
+                      shared_weights=False,
+                     ):
+    # train a familly of SAEs with cycle consistency on several train loaders. When loss includes primary losses, the train loaders must provide matching pairs.
+    
+    nb_concepts = d_model * expansion_factor
+    
+    if batch_size is None:
+        batch_size = train_loaders[0].batch_size
+
+    if archi not in supported_archi:
+        raise ValueError(f"Unsupported architecture: {archi}. Supported architectures: {supported_archi}")
+    
+    class mouahahaIvenoideawhyglobaldoesntworksoletsdoanobject():
+        def __init__(self, alpha=1e-3):
+            self.alpha = alpha
+    maxialpha = mouahahaIvenoideawhyglobaldoesntworksoletsdoanobject(alpha=1e-3)
+
+    saes = []
+    losses = []
+    
+    for _ in range(len(train_loaders)):
+        sae, criterion_1, alpha = initialize_dictionary(
+            archi, top_k, d_model, nb_concepts, maxialpha, batch_size, device=device
+        )
+        sae.to(device).train()
+        saes.append(sae)
+        loss_ = SAE_loss(
+            reconstruction_loss=criterion_1,
+            alpha_tr=loss.alpha_tr,
+            alpha_cont=loss.alpha_cont,
+            alpha_IsoE=loss.alpha_IsoE,
+            alpha_dcy=loss.alpha_dcy,
+            alpha_cy=loss.alpha_cy,
+        )
+        losses.append(loss_)
+
+    if shared_weights:
+        for i in range(1, len(saes)):
+            saes[i] = saes[0]
+    elif shared_init:
+        # share the same initialization for all saes but not the same weights during training
+        base_state_dict = saes[0].state_dict()
+        for i in range(1, len(saes)):
+            saes[i].load_state_dict(base_state_dict)
+
+    optimizers = [torch.optim.Adam(sae.parameters(), lr=lr) for sae in saes]
+
+    schedulers = [None for _ in saes]
+    # for i in range(len(saes)):
+    #     steps_per_epoch = len(train_loaders[i])
+    #     schedulers[i] = torch.optim.lr_scheduler.OneCycleLR(
+    #         optimizers[i], max_lr=lr, total_steps=epochs * steps_per_epoch,
+    #     )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sae_name = model_name + "/"
+    sae_name += f"{dataset_name}_{archi}" + f"_{expansion_factor}_L0_{top_k}" + f"_cycleisoE_" + timestamp
+    print(f"Model name: {sae_name}")
+
+    checkpoint_path = "./checkpoints"
+    logs = train.train_multiple_saes(
+        saes, train_loaders, losses, optimizers, schedulers=schedulers, nb_epochs=epochs, N_tokens=N_tokens, device=device,
+        monitoring=1, verbose=True,
+        checkpoint_path=checkpoint_path,
+        checkpoint_interval=5, checkpoint_name=sae_name,
+        run=run,
+    )
+    
+    for sae in saes:
+        sae.eval()
+    return saes, sae_name, logs
 
 @dataclass
 class Metrics:
